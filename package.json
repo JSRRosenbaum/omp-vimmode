@@ -29,7 +29,8 @@
     "release-notes.json",
     "docs/config.md",
     "docs/features.md",
-    "docs/settings.md"
+    "docs/settings.md",
+    "omp-adapter.ts"
   ],
   "type": "module",
   "module": "index.ts",
@@ -67,7 +68,7 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./omp-adapter.ts"
     ]
   }
 }

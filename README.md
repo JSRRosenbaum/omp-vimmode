@@ -4,6 +4,20 @@ Vim-style prompt editing for [Pi](https://pi.dev/).
 
 `pi-vimmode` replaces Pi's main input editor with a `CustomEditor`-based modal editor. It targets practical prompt editing for agent prompts, not full Vim parity.
 
+## Oh My Pi (OMP) fork
+
+This fork loads through `omp-adapter.ts` (`package.json` → `pi.extensions`) instead of `index.ts`. OMP omits `ctx.ui.getEditorComponent()`, which the stock lifecycle requires, so the adapter installs the editor directly and leaves settings at defaults with insert start mode.
+
+Mode display is drawn in the band composer's prompt corner rather than the status line:
+
+```
+<status band>
+│  2d…            ← only while Vim grammar is pending
+╰N vim motions    ← I / N / V / L (visual line) / B (visual block)
+```
+
+The cue replaces `╰─ ` at the same 3-cell width. Composer shapes without the `╰` corner are untouched. Helpers live in `src/omp-status.ts`; run `bun test test/omp-status.test.ts`.
+
 ## Breaking changes
 
 ### v0.7.0
