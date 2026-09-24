@@ -1,0 +1,367 @@
+import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
+import { describe, expect, test } from "bun:test";
+
+import type { CursorStyle, VimMode } from "../src/types.ts";
+
+import {
+  CURSOR_BAR_START,
+  CURSOR_BLOCK_START,
+  CURSOR_UNDERLINE_START,
+  ANSI_RESET,
+  renderCursorCell,
+  renderPromptEditor,
+  renderVisualEditor,
+  restyleCursorMarker,
+  SEARCH_CURRENT_START,
+  SEARCH_START,
+  SELECTION_START,
+} from "../src/render.ts";
+
+const p = (line: number, col: number) => ({ line, col });
+
+type VisualFixture = {
+  lines: string[];
+  cursor: ReturnType<typeof p>;
+  visualAnchor: ReturnType<typeof p>;
+  mode: Extract<VimMode, "visual" | "visualLine" | "visualBlock">;
+  cursorStyle?: CursorStyle;
+  width?: number;
+  terminalRows?: number;
+  focused?: boolean;
+  offset?: number;
+  onOffset?: (offset: number) => void;
+};
+
+function renderVisual(fixture: VisualFixture): string[] {
+  return renderVisualEditor({
+    snapshot: {
+      lines: fixture.lines,
+      cursor: fixture.cursor,
+    },
+    visual: {
+      mode: fixture.mode,
+      anchor: fixture.visualAnchor,
+    },
+    cursorStyle: fixture.cursorStyle ?? "block",
+    viewport: {
+      width: fixture.width ?? 20,
+      terminalRows: fixture.terminalRows,
+      focused: fixture.focused,
+      offset: fixture.offset,
+      onOffset: fixture.onOffset,
+    },
+  });
+}
+
+function expectWidthSafe(lines: string[], width: number) {
+  for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+}
+
+function stripAnsi(text: string): string {
+  return text
+    .replaceAll(SELECTION_START, "")
+    .replaceAll(CURSOR_BLOCK_START, "")
+    .replaceAll(CURSOR_UNDERLINE_START, "")
+    .replaceAll(CURSOR_BAR_START, "")
+    .replaceAll(SEARCH_CURRENT_START, "")
+    .replaceAll(SEARCH_START, "")
+    .replaceAll(ANSI_RESET, "");
+}
+
+describe("search highlight render helper", () => {
+  test("renders search and current-match highlights width-safely", () => {
+    const lines = renderPromptEditor({
+      snapshot: { text: "one two one", lines: ["one two one"], cursor: p(0, 8) },
+      cursorStyle: "block",
+      viewport: { width: 20, focused: false },
+      search: { query: "one", current: p(0, 8), highlightCurrent: true, maxHighlights: 20 },
+    });
+    const output = lines.join("\n");
+    expect(output).toContain(SEARCH_START);
+    expect(output).toContain(SEARCH_CURRENT_START);
+    expectWidthSafe(lines, 20);
+  });
+
+  test("visual selection takes precedence over search highlights", () => {
+    const lines = renderVisualEditor({
+      snapshot: { text: "one two one", lines: ["one two one"], cursor: p(0, 2) },
+      visual: { mode: "visual", anchor: p(0, 0) },
+      cursorStyle: "block",
+      viewport: { width: 20, focused: false },
+      search: { query: "one", current: p(0, 8), highlightCurrent: true, maxHighlights: 20 },
+    });
+    const output = lines.join("\n");
+    expect(output).toContain(SELECTION_START);
+    expect(output).toContain(SEARCH_CURRENT_START);
+    expectWidthSafe(lines, 20);
+  });
+});
+
+describe("visual render helper", () => {
+  test("highlights characterwise selected text", () => {
+    const lines = renderVisual({
+      lines: ["abcd"],
+      cursor: p(0, 2),
+      visualAnchor: p(0, 1),
+      mode: "visual",
+      width: 20,
+    });
+    expect(lines.join("\n")).toContain(SELECTION_START);
+    expect(lines.join("\n")).toContain(CURSOR_BLOCK_START);
+    expectWidthSafe(lines, 20);
+  });
+
+  test("highlights visual line selections including empty selected lines", () => {
+    const lines = renderVisual({
+      lines: ["one", "", "three"],
+      cursor: p(2, 0),
+      visualAnchor: p(0, 0),
+      mode: "visualLine",
+      cursorStyle: "underline",
+      width: 12,
+    });
+    const output = lines.join("\n");
+    expect(output).toContain(SELECTION_START);
+    expect(output).toContain(CURSOR_UNDERLINE_START);
+    expectWidthSafe(lines, 12);
+  });
+
+  test("keeps wrapped selections width-safe", () => {
+    const lines = renderVisual({
+      lines: ["alpha beta gamma delta"],
+      cursor: p(0, 18),
+      visualAnchor: p(0, 0),
+      mode: "visual",
+      cursorStyle: "bar",
+      width: 8,
+    });
+    expect(lines.length).toBeGreaterThan(3);
+    expect(lines.join("\n")).toContain(CURSOR_BAR_START);
+    expectWidthSafe(lines, 8);
+  });
+
+  test("highlights visual block selections as rectangles", () => {
+    const lines = renderVisual({
+      lines: ["abcdef", "xx", "123456"],
+      cursor: p(2, 4),
+      visualAnchor: p(0, 2),
+      mode: "visualBlock",
+      cursorStyle: "underline",
+      width: 16,
+    });
+    const output = lines.join("\n");
+    expect(output).toContain(`${SELECTION_START}c`);
+    expect(output).toContain(`${SELECTION_START}3`);
+    expect(output).not.toContain(`${SELECTION_START}x`);
+    expect(output).toContain(CURSOR_UNDERLINE_START);
+    expectWidthSafe(lines, 16);
+  });
+
+  test("handles narrow widths", () => {
+    expect(
+      renderVisual({
+        lines: ["abc"],
+        cursor: p(0, 0),
+        visualAnchor: p(0, 0),
+        mode: "visual",
+        width: 0,
+      }),
+    ).toEqual([]);
+    expectWidthSafe(
+      renderVisual({
+        lines: ["abc"],
+        cursor: p(0, 0),
+        visualAnchor: p(0, 0),
+        mode: "visual",
+        width: 1,
+      }),
+      1,
+    );
+  });
+
+  test("renders cursor styling instead of selection styling for selected cursor cell", () => {
+    const output = renderVisual({
+      lines: ["abcd"],
+      cursor: p(0, 1),
+      visualAnchor: p(0, 0),
+      mode: "visual",
+      width: 20,
+    }).join("\n");
+
+    expect(output).toContain(CURSOR_BLOCK_START);
+    expect(output).not.toContain(`${SELECTION_START}b`);
+  });
+
+  test("renders cursor at end of last wrapped chunk", () => {
+    const lines = renderVisual({
+      lines: ["abcdef"],
+      cursor: p(0, 6),
+      visualAnchor: p(0, 0),
+      mode: "visual",
+      cursorStyle: "underline",
+      width: 4,
+    });
+
+    expect(lines.join("\n")).toContain(CURSOR_UNDERLINE_START);
+    expectWidthSafe(lines, 4);
+  });
+
+  test("renders scroll indicators when visual layout exceeds viewport", () => {
+    const lines = renderVisual({
+      lines: ["one", "two", "three", "four", "five", "six", "seven", "eight"],
+      cursor: p(2, 0),
+      visualAnchor: p(0, 0),
+      mode: "visualLine",
+      width: 12,
+      terminalRows: 6,
+    });
+
+    const output = lines.join("\n");
+    expect(output).toContain("↑");
+    expect(output).toContain("↓");
+    expectWidthSafe(lines, 12);
+  });
+
+  test("keeps previous viewport offset while cursor remains visible", () => {
+    let offset: number | undefined;
+    const lines = renderVisual({
+      lines: ["one", "two", "three", "four", "five", "six", "seven", "eight"],
+      cursor: p(3, 0),
+      visualAnchor: p(3, 0),
+      mode: "visualLine",
+      width: 12,
+      terminalRows: 20,
+      offset: 2,
+      onOffset: (value) => {
+        offset = value;
+      },
+    });
+
+    expect(offset).toBe(2);
+    expect(lines[1]).toContain("three");
+    expectWidthSafe(lines, 12);
+  });
+
+  test("scrolls minimally when cursor moves below visible viewport", () => {
+    let offset: number | undefined;
+    const lines = renderVisual({
+      lines: ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"],
+      cursor: p(8, 0),
+      visualAnchor: p(3, 0),
+      mode: "visualLine",
+      width: 12,
+      terminalRows: 20,
+      offset: 2,
+      onOffset: (value) => {
+        offset = value;
+      },
+    });
+
+    const output = stripAnsi(lines.join("\n"));
+    expect(offset).toBe(3);
+    expect(output).toContain("four");
+    expect(output).toContain("nine");
+    expectWidthSafe(lines, 12);
+  });
+});
+
+describe("EasyMotion rendering", () => {
+  test("renders target label under cursor", () => {
+    const lines = renderPromptEditor({
+      snapshot: { text: "one", lines: ["one"], cursor: p(0, 0) },
+      cursorStyle: "block",
+      viewport: { width: 10, focused: true },
+      easymotion: { targets: [{ line: 0, character: 0, label: "a" }], labelColor: "red" },
+    });
+
+    expect(lines.join("\n")).toContain(`${CURSOR_BLOCK_START}a${ANSI_RESET}`);
+    expect(lines.join("\n")).not.toContain(`${CURSOR_BLOCK_START}o${ANSI_RESET}`);
+  });
+
+  test("preserves wide target cell width", () => {
+    const lines = renderPromptEditor({
+      snapshot: { text: "界x", lines: ["界x"], cursor: p(0, 2) },
+      cursorStyle: "block",
+      viewport: { width: 10, focused: false },
+      easymotion: { targets: [{ line: 0, character: 0, label: "a" }], labelColor: "red" },
+    });
+
+    expect(visibleWidth(lines[1]!)).toBe(10);
+    expect(lines.join("\n")).toContain("a ");
+  });
+
+  test("substitutes labels across multiline prompt with configured color and reset", () => {
+    const labelColor = "\x1b[32m";
+    const lines = renderPromptEditor({
+      snapshot: { text: "one\ntwo", lines: ["one", "two"], cursor: p(0, 0) },
+      cursorStyle: "block",
+      viewport: { width: 10, focused: false },
+      easymotion: { targets: [{ line: 1, character: 1, label: "x" }], labelColor },
+    });
+
+    expect(lines.join("\n")).toContain(`${labelColor}x${ANSI_RESET}`);
+    expect(stripAnsi(lines.join("\n")).replaceAll(labelColor, "")).toContain("txo");
+  });
+
+  test("cursor and visual selection styling take precedence over EasyMotion color", () => {
+    const labelColor = "\x1b[32m";
+    const cursorLines = renderPromptEditor({
+      snapshot: { text: "one", lines: ["one"], cursor: p(0, 1) },
+      cursorStyle: "block",
+      viewport: { width: 10, focused: true },
+      easymotion: { targets: [{ line: 0, character: 1, label: "x" }], labelColor },
+    });
+    const selectedLines = renderVisualEditor({
+      snapshot: { text: "one", lines: ["one"], cursor: p(0, 2) },
+      visual: { mode: "visual", anchor: p(0, 0) },
+      cursorStyle: "block",
+      viewport: { width: 10, focused: false },
+      easymotion: { targets: [{ line: 0, character: 1, label: "x" }], labelColor },
+    });
+
+    expect(cursorLines.join("\n")).toContain(`${CURSOR_BLOCK_START}x${ANSI_RESET}`);
+    expect(cursorLines.join("\n")).not.toContain(`${labelColor}x${ANSI_RESET}`);
+    expect(selectedLines.join("\n")).toContain(`${SELECTION_START}x${ANSI_RESET}`);
+    expect(selectedLines.join("\n")).not.toContain(`${labelColor}x${ANSI_RESET}`);
+  });
+
+  test("EasyMotion label takes precedence over search highlight", () => {
+    const labelColor = "\x1b[32m";
+    const lines = renderPromptEditor({
+      snapshot: { text: "one one", lines: ["one one"], cursor: p(0, 6) },
+      cursorStyle: "block",
+      viewport: { width: 20, focused: false },
+      search: { query: "one", current: p(0, 0), highlightCurrent: true, maxHighlights: 20 },
+      easymotion: { targets: [{ line: 0, character: 0, label: "x" }], labelColor },
+    });
+
+    expect(lines.join("\n")).toContain(`${labelColor}x${ANSI_RESET}`);
+    expect(lines.join("\n")).not.toContain(`${SEARCH_CURRENT_START}x${ANSI_RESET}`);
+  });
+});
+
+describe("cursor rendering", () => {
+  test("renders distinct cursor style markers", () => {
+    expect(renderCursorCell("x", "block")).toContain(CURSOR_BLOCK_START);
+    expect(renderCursorCell("x", "bar")).toContain(CURSOR_BAR_START);
+    expect(renderCursorCell("x", "underline")).toContain(CURSOR_UNDERLINE_START);
+  });
+
+  test("bar cursor preserves the cell character width-safely", () => {
+    const rendered = renderCursorCell("x", "bar");
+    expect(rendered).toContain(CURSOR_BAR_START);
+    expect(rendered).toContain("x");
+    expect(rendered).not.toContain("\u20d2");
+    expect(rendered).not.toContain("▌");
+    expect(visibleWidth(rendered)).toBe(1);
+    expect(visibleWidth(renderCursorCell("", "bar"))).toBe(1);
+  });
+
+  test("restyles Pi cursor marker output when marker is available", () => {
+    const restyled = restyleCursorMarker([`${CURSOR_MARKER}\x1b[7mx\x1b[0m`], "bar");
+    expect(restyled[0]).toContain(CURSOR_MARKER);
+    expect(restyled[0]).toContain(CURSOR_BAR_START);
+    expect(restyled[0]).toContain("x");
+    expect(restyled[0]).not.toContain("\u20d2");
+  });
+});

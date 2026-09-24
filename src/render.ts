@@ -1,0 +1,491 @@
+import { CURSOR_MARKER, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+
+import type { CursorStyle, EasymotionTarget, Position, TextRange, VimMode } from "./types.ts";
+
+import { findSearchHighlightRanges } from "./buffer.ts";
+import { isVisualCellSelected, isVisualLineSelected } from "./visual-selection.ts";
+
+export const SELECTION_START = "\x1b[7m";
+export const SEARCH_START = "\x1b[43m";
+export const SEARCH_CURRENT_START = "\x1b[30;43m";
+export const CURSOR_BLOCK_START = "\x1b[4;7m";
+export const CURSOR_UNDERLINE_START = "\x1b[4m";
+export const CURSOR_BAR_START = "\x1b[1m";
+export const ANSI_RESET = "\x1b[0m";
+
+type TextChunk = {
+  text: string;
+  startIndex: number;
+  endIndex: number;
+};
+
+type LayoutLine = {
+  lineIndex: number;
+  text: string;
+  startIndex: number;
+  endIndex: number;
+  isLastChunk: boolean;
+};
+
+export type SearchHighlightRenderInput = {
+  query: string;
+  current?: Position;
+  currentRange?: TextRange;
+  ranges?: TextRange[];
+  highlightCurrent: boolean;
+  maxHighlights: number;
+};
+
+export type EasymotionRenderInput = {
+  targets: EasymotionTarget[];
+  labelColor: string;
+};
+
+export type PromptRenderInput = {
+  snapshot: {
+    lines: string[];
+    text: string;
+    cursor: Position;
+  };
+  cursorStyle: CursorStyle;
+  viewport: {
+    width: number;
+    terminalRows?: number;
+    focused?: boolean;
+    offset?: number;
+    onOffset?: (offset: number) => void;
+  };
+  search?: SearchHighlightRenderInput;
+  display?: {
+    borderColor?: (text: string) => string;
+  };
+  easymotion?: EasymotionRenderInput;
+};
+
+export type ActiveVisualRenderInput = {
+  snapshot: {
+    lines: string[];
+    text?: string;
+    cursor: Position;
+  };
+  visual: {
+    mode: Extract<VimMode, "visual" | "visualLine" | "visualBlock">;
+    anchor: Position;
+  };
+  cursorStyle: CursorStyle;
+  viewport: {
+    width: number;
+    terminalRows?: number;
+    focused?: boolean;
+    offset?: number;
+    onOffset?: (offset: number) => void;
+  };
+  search?: SearchHighlightRenderInput;
+  display?: {
+    borderColor?: (text: string) => string;
+  };
+  easymotion?: EasymotionRenderInput;
+};
+
+type VisualRenderView = {
+  lines: string[];
+  cursor: Position;
+  mode?: Extract<VimMode, "visual" | "visualLine" | "visualBlock">;
+  visualAnchor?: Position;
+  cursorStyle: CursorStyle;
+  width: number;
+  terminalRows?: number;
+  focused?: boolean;
+  offset?: number;
+  onOffset?: (offset: number) => void;
+  borderColor?: (text: string) => string;
+  search?: SearchHighlightRenderInput;
+  searchRanges: TextRange[];
+  easymotion: EasymotionRenderInput | undefined;
+};
+
+function styleSelection(text: string): string {
+  return `${SELECTION_START}${text}${ANSI_RESET}`;
+}
+
+function styleSearch(text: string): string {
+  return `${SEARCH_START}${text}${ANSI_RESET}`;
+}
+
+function styleCurrentSearch(text: string): string {
+  return `${SEARCH_CURRENT_START}${text}${ANSI_RESET}`;
+}
+
+function fitEasymotionLabel(label: string, width: number): string {
+  const truncated = truncateToWidth(label, width, "");
+  return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
+}
+
+export function renderCursorCell(cell: string, style: CursorStyle): string {
+  const safeCell = cell.length > 0 ? cell : " ";
+  switch (style) {
+    case "bar":
+      return `${CURSOR_BAR_START}${safeCell}${ANSI_RESET}`;
+    case "underline":
+      return `${CURSOR_UNDERLINE_START}${safeCell}${ANSI_RESET}`;
+    case "block":
+      return `${CURSOR_BLOCK_START}${safeCell}${ANSI_RESET}`;
+  }
+}
+
+export function cursorShapeEscape(style: CursorStyle): string {
+  switch (style) {
+    case "block":
+      return "\x1b[2 q";
+    case "underline":
+      return "\x1b[4 q";
+    case "bar":
+      return "\x1b[6 q";
+  }
+}
+
+export const RESET_CURSOR_SHAPE = "\x1b[0 q";
+
+function isSelectedCell(
+  mode: VisualRenderView["mode"],
+  lines: string[],
+  anchor: Position | undefined,
+  cursor: Position,
+  lineIndex: number,
+  col: number,
+): boolean {
+  return !!mode && !!anchor && isVisualCellSelected(mode, lines, anchor, cursor, lineIndex, col);
+}
+
+function isLineSelected(
+  mode: VisualRenderView["mode"],
+  lines: string[],
+  anchor: Position | undefined,
+  cursor: Position,
+  lineIndex: number,
+): boolean {
+  return !!mode && !!anchor && isVisualLineSelected(mode, lines, anchor, cursor, lineIndex);
+}
+
+function isCellInRange(range: TextRange, lineIndex: number, col: number): boolean {
+  if (lineIndex < range.start.line || lineIndex > range.end.line) return false;
+  if (range.start.line === range.end.line) return col >= range.start.col && col <= range.end.col;
+  if (lineIndex === range.start.line) return col >= range.start.col;
+  if (lineIndex === range.end.line) return col <= range.end.col;
+  return true;
+}
+
+function searchRangeAt(
+  options: VisualRenderView,
+  lineIndex: number,
+  col: number,
+): "current" | "other" | undefined {
+  const current = options.search?.current;
+  if (options.search?.highlightCurrent) {
+    const currentRange =
+      options.search.currentRange ??
+      (current
+        ? {
+            start: current,
+            end: { line: current.line, col: current.col + options.search.query.length - 1 },
+          }
+        : undefined);
+    if (currentRange && isCellInRange(currentRange, lineIndex, col)) return "current";
+  }
+  return options.searchRanges.some((range) => isCellInRange(range, lineIndex, col))
+    ? "other"
+    : undefined;
+}
+
+function wordWrapLine(line: string, width: number): TextChunk[] {
+  const chunks: TextChunk[] = [];
+  let current = "";
+  let currentStart = 0;
+  let currentWidth = 0;
+  let offset = 0;
+
+  for (const cell of Array.from(line)) {
+    const cellWidth = Math.max(1, visibleWidth(cell));
+    if (current.length > 0 && currentWidth + cellWidth > width) {
+      chunks.push({ text: current, startIndex: currentStart, endIndex: offset });
+      current = "";
+      currentStart = offset;
+      currentWidth = 0;
+    }
+
+    current += cell;
+    currentWidth += cellWidth;
+    offset += cell.length;
+  }
+
+  if (current.length > 0) {
+    chunks.push({ text: current, startIndex: currentStart, endIndex: offset });
+  }
+
+  return chunks.length === 0 ? [{ text: "", startIndex: 0, endIndex: 0 }] : chunks;
+}
+
+function safeChunks(line: string, width: number): TextChunk[] {
+  if (line.length === 0) return [{ text: "", startIndex: 0, endIndex: 0 }];
+  if (visibleWidth(line) <= width) return [{ text: line, startIndex: 0, endIndex: line.length }];
+  return wordWrapLine(line, width);
+}
+
+function layoutLines(lines: string[], width: number): LayoutLine[] {
+  const result: LayoutLine[] = [];
+  const safeLines = lines.length === 0 ? [""] : lines;
+
+  for (let lineIndex = 0; lineIndex < safeLines.length; lineIndex++) {
+    const line = safeLines[lineIndex] ?? "";
+    const chunks = safeChunks(line, width);
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+      const chunk = chunks[chunkIndex];
+      if (!chunk) continue;
+      result.push({
+        lineIndex,
+        text: chunk.text,
+        startIndex: chunk.startIndex,
+        endIndex: chunk.endIndex,
+        isLastChunk: chunkIndex === chunks.length - 1,
+      });
+    }
+  }
+
+  return result.length === 0
+    ? [{ lineIndex: 0, text: "", startIndex: 0, endIndex: 0, isLastChunk: true }]
+    : result;
+}
+
+function chunkHasCursor(chunk: LayoutLine, cursor: Position): boolean {
+  if (cursor.line !== chunk.lineIndex) return false;
+  if (chunk.isLastChunk) return cursor.col >= chunk.startIndex;
+  return cursor.col >= chunk.startIndex && cursor.col < chunk.endIndex;
+}
+
+function renderLayoutLine(
+  chunk: LayoutLine,
+  options: VisualRenderView,
+): { text: string; width: number } {
+  const line = options.lines[chunk.lineIndex] ?? "";
+  const marker = options.focused && chunkHasCursor(chunk, options.cursor) ? CURSOR_MARKER : "";
+  let output = "";
+  let renderedWidth = 0;
+  let offset = 0;
+  let cursorRendered = false;
+
+  while (offset < chunk.text.length) {
+    const cell = Array.from(chunk.text.slice(offset))[0] ?? "";
+    const cellStart = chunk.startIndex + offset;
+    const cellWidth = visibleWidth(cell);
+    const easymotionTarget = options.easymotion?.targets.find(
+      (target) => target.line === chunk.lineIndex && target.character === cellStart,
+    );
+    const displayCell =
+      easymotionTarget && options.easymotion
+        ? fitEasymotionLabel(easymotionTarget.label, cellWidth)
+        : cell;
+    const isCursor = options.cursor.line === chunk.lineIndex && options.cursor.col === cellStart;
+
+    if (isCursor) {
+      output += marker + renderCursorCell(displayCell, options.cursorStyle);
+      cursorRendered = true;
+    } else if (
+      isSelectedCell(
+        options.mode,
+        options.lines,
+        options.visualAnchor,
+        options.cursor,
+        chunk.lineIndex,
+        cellStart,
+      )
+    ) {
+      output += styleSelection(displayCell);
+    } else if (easymotionTarget && options.easymotion) {
+      output += options.easymotion.labelColor + displayCell + ANSI_RESET;
+    } else {
+      const searchStyle = searchRangeAt(options, chunk.lineIndex, cellStart);
+      if (searchStyle === "current") output += styleCurrentSearch(cell);
+      else if (searchStyle === "other") output += styleSearch(cell);
+      else output += cell;
+    }
+
+    renderedWidth += cellWidth;
+    offset += cell.length;
+  }
+
+  const cursorAtEnd =
+    options.cursor.line === chunk.lineIndex &&
+    options.cursor.col >= chunk.endIndex &&
+    chunk.isLastChunk;
+  const selectedEmptyVisualLine =
+    line.length === 0 &&
+    isLineSelected(
+      options.mode,
+      options.lines,
+      options.visualAnchor,
+      options.cursor,
+      chunk.lineIndex,
+    );
+
+  if (cursorAtEnd && !cursorRendered) {
+    output += marker + renderCursorCell(" ", options.cursorStyle);
+    renderedWidth += 1;
+  } else if (selectedEmptyVisualLine && renderedWidth === 0) {
+    output += styleSelection(" ");
+    renderedWidth += 1;
+  }
+
+  return { text: output, width: renderedWidth };
+}
+
+function resolveViewportOffset(
+  layout: LayoutLine[],
+  cursor: Position,
+  maxVisible: number,
+  previousOffset: number | undefined,
+): number {
+  let cursorIndex = layout.findIndex((line) => chunkHasCursor(line, cursor));
+  if (cursorIndex === -1) cursorIndex = 0;
+  const maxOffset = Math.max(0, layout.length - maxVisible);
+  const offset = Math.max(0, Math.min(previousOffset ?? cursorIndex, maxOffset));
+  if (cursorIndex < offset) return cursorIndex;
+  if (cursorIndex >= offset + maxVisible) return Math.min(cursorIndex - maxVisible + 1, maxOffset);
+  return offset;
+}
+
+function scrollWindow(
+  layout: LayoutLine[],
+  cursor: Position,
+  terminalRows: number,
+  previousOffset?: number,
+): { visible: LayoutLine[]; offset: number } {
+  const maxVisible = Math.max(5, Math.floor(terminalRows * 0.3));
+  const offset = resolveViewportOffset(layout, cursor, maxVisible, previousOffset);
+  return { visible: layout.slice(offset, offset + maxVisible), offset };
+}
+
+function createSearchRanges(
+  text: string,
+  search: SearchHighlightRenderInput | undefined,
+): TextRange[] {
+  if (!search) return [];
+  if (search.ranges) return search.ranges.slice(0, Math.max(0, search.maxHighlights));
+  return findSearchHighlightRanges(text, search.query, Math.max(0, search.maxHighlights));
+}
+
+function createPromptRenderView(input: PromptRenderInput): VisualRenderView {
+  return {
+    lines: input.snapshot.lines,
+    cursor: input.snapshot.cursor,
+    cursorStyle: input.cursorStyle,
+    width: input.viewport.width,
+    terminalRows: input.viewport.terminalRows,
+    focused: input.viewport.focused,
+    offset: input.viewport.offset,
+    onOffset: input.viewport.onOffset,
+    borderColor: input.display?.borderColor,
+    search: input.search,
+    searchRanges: createSearchRanges(input.snapshot.text, input.search),
+    easymotion: input.easymotion,
+  };
+}
+
+function createVisualRenderView(input: ActiveVisualRenderInput): VisualRenderView {
+  const text = input.snapshot.text ?? input.snapshot.lines.join("\n");
+  return {
+    lines: input.snapshot.lines,
+    cursor: input.snapshot.cursor,
+    mode: input.visual.mode,
+    visualAnchor: input.visual.anchor,
+    cursorStyle: input.cursorStyle,
+    width: input.viewport.width,
+    terminalRows: input.viewport.terminalRows,
+    focused: input.viewport.focused,
+    offset: input.viewport.offset,
+    onOffset: input.viewport.onOffset,
+    borderColor: input.display?.borderColor,
+    search: input.search,
+    searchRanges: createSearchRanges(text, input.search),
+    easymotion: input.easymotion,
+  };
+}
+
+function renderEditorView(options: VisualRenderView): string[] {
+  if (options.width <= 0) return [];
+
+  const borderColor = options.borderColor ?? ((text: string) => text);
+  const horizontal = borderColor("─".repeat(options.width));
+  const contentWidth = Math.max(1, options.width - 1);
+  const layout = layoutLines(options.lines, contentWidth);
+  const { visible, offset } = scrollWindow(
+    layout,
+    options.cursor,
+    options.terminalRows ?? 24,
+    options.offset,
+  );
+  options.onOffset?.(offset);
+  const result: string[] = [];
+
+  if (offset > 0) {
+    const indicator = `─── ↑ ${offset} more `;
+    const remaining = options.width - visibleWidth(indicator);
+    result.push(
+      borderColor(
+        remaining >= 0
+          ? indicator + "─".repeat(remaining)
+          : truncateToWidth(indicator, options.width),
+      ),
+    );
+  } else {
+    result.push(horizontal);
+  }
+
+  for (const layoutLine of visible) {
+    const rendered = renderLayoutLine(layoutLine, options);
+    const padding = " ".repeat(Math.max(0, options.width - rendered.width));
+    let line = `${rendered.text}${padding}`;
+    if (visibleWidth(line) > options.width) line = truncateToWidth(line, options.width, "");
+    result.push(line);
+  }
+
+  const linesBelow = layout.length - (offset + visible.length);
+  if (linesBelow > 0) {
+    const indicator = `─── ↓ ${linesBelow} more `;
+    const remaining = options.width - visibleWidth(indicator);
+    result.push(
+      borderColor(
+        remaining >= 0
+          ? indicator + "─".repeat(remaining)
+          : truncateToWidth(indicator, options.width),
+      ),
+    );
+  } else {
+    result.push(horizontal);
+  }
+
+  return result;
+}
+
+export function renderPromptEditor(input: PromptRenderInput): string[] {
+  return renderEditorView(createPromptRenderView(input));
+}
+
+export function renderVisualEditor(input: ActiveVisualRenderInput): string[] {
+  return renderEditorView(createVisualRenderView(input));
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function restyleCursorMarker(lines: string[], style: CursorStyle): string[] {
+  if (style === "block") return lines;
+  const marker = escapeRegExp(CURSOR_MARKER);
+  const cursorPattern = new RegExp(`${marker}\\x1b\\[7m([\\s\\S]*?)\\x1b\\[0m`);
+  return lines.map((line) =>
+    line.replace(
+      cursorPattern,
+      (_match, cell: string) => `${CURSOR_MARKER}${renderCursorCell(cell, style)}`,
+    ),
+  );
+}
