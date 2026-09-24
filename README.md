@@ -1,10 +1,17 @@
-# pi-vimmode
+# omp-vimmode
 
-Vim-style prompt editing for [Pi](https://pi.dev/).
+Vim-style prompt editing for [Oh My Pi](https://github.com/can1357/oh-my-pi) (OMP), forked from [`pi-vimmode`](https://github.com/pekochan069/pi-vimmode) v0.9.0 by pekochan069 (MIT).
 
-`pi-vimmode` replaces Pi's main input editor with a `CustomEditor`-based modal editor. It targets practical prompt editing for agent prompts, not full Vim parity.
+The editor replaces the main input with a `CustomEditor`-based modal editor. It targets practical prompt editing for agent prompts, not full Vim parity. Upstream sections below still describe Pi installs; internal identifiers (`piVimMode` settings, the `pi-vimmode` status key) are unchanged.
 
-## Oh My Pi (OMP) fork
+## OMP install
+
+```sh
+git clone https://github.com/JSRRosenbaum/omp-vimmode
+omp plugin link ./omp-vimmode
+```
+
+## OMP adapter
 
 This fork loads through `omp-adapter.ts` (`package.json` → `pi.extensions`) instead of `index.ts`. OMP omits `ctx.ui.getEditorComponent()`, which the stock lifecycle requires, so the adapter installs the editor directly and leaves settings at defaults with insert start mode.
 
